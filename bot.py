@@ -3,19 +3,23 @@ import re
 import sqlite3
 import asyncio
 from contextlib import closing
-
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
+from keep_alive import keep_alive
+keep_alive()
+
 
 # ================== ENV ==================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CURRENCY = os.getenv("CURRENCY", "RUB")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "manager_username")
 
 if not BOT_TOKEN:
     raise SystemExit("❌ Не задан BOT_TOKEN в .env")
@@ -25,8 +29,7 @@ dp = Dispatcher()
 
 # === Реквизиты для перевода (ПОМЕНИ ВНИЗУ НА СВОИ!) ===
 PAY_INSTRUCTIONS = (
-    "💳 Оплата: переведите сумму на карту `1234 5678 9012 3456`\n"
-    "или по телефону `+7 900 000-00-00`\n\n"
+    "💳 Оплата: переведите сумму на карту `2204 3206 4163 7824`\n"
     "После оплаты отправьте сюда чек или скриншот."
 )
 
@@ -212,6 +215,16 @@ def kb_main():
     kb.adjust(2, 2)  # 2 в ряд, последняя строка тоже уместится
     return kb.as_markup()
 
+def support_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(text="📩 Написать в чат поддержки", callback_data="support_chat")],
+        [InlineKeyboardButton(
+            text=f"👤 Написать менеджеру (@{MANAGER_USERNAME})",
+            url=f"https://t.me/{MANAGER_USERNAME}"
+        )]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
 def product_list_kb():
     kb = InlineKeyboardBuilder()
     prods = list_products()
@@ -291,7 +304,7 @@ CITIES = [
     ("stl", "Ставрополь"),
     ("khn", "Хабаровск"),
     ("yar", "Ярославль"),
-    ("vlr", "Владивосток"),
+    ("dbg", "Джубга"),
     ("mah", "Махачкала"),
 ]
 
@@ -389,32 +402,50 @@ async def show_catalog(cq: CallbackQuery):
     await cq.message.answer("Выберите товар:", reply_markup=product_list_kb())
     await cq.answer()
 
-# Нажали на товар → спросим количество
-# Нажали на товар → спросим количество (с фото товара)
+@dp.callback_query(F.data == "support_chat")
+async def support_chat(cq: CallbackQuery):
+    await cq.message.answer(
+        "📨 Напишите ваш вопрос одной строкой:\n"
+        "`/support ваш_вопрос`\n\n"
+        "_Через чат обычно отвечаем быстрее._",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await cq.answer()
+
+# Нажали на товар → фото + ОПИСАНИЕ + кнопки количества
 @dp.callback_query(F.data.startswith("prod:"))
 async def choose_product_qty(cq: CallbackQuery):
     pid = int(cq.data.split(":")[1])
+    p = get_product_by_id(pid)  # <- твой хелпер из БД
 
-    p = get_product_by_id(pid)
     if not p or not p["is_active"]:
         await cq.answer("Товар не найден", show_alert=True)
         return
 
-    # клавиатура с количествами
+    # клавиатура с количеством
     kb = InlineKeyboardBuilder()
     for q in (1, 2, 10, 20):
         kb.button(text=f"{q}", callback_data=f"addqty:{pid}:{q}")
     kb.button(text="⬅️ Каталог", callback_data="catalog")
     kb.adjust(4, 1)
 
-    caption = f"Какая граммовка «{p['title']}»?\nЦена: {p['price_cents']/100:.2f} {p['currency']}"
+    # описание (укоротим до ~700 символов, чтобы не упереться в лимит подписи)
+    desc = (p["description"] or "").strip()
+    if len(desc) > 700:
+        desc = desc[:700].rstrip() + "…"
 
-    # пробуем показать фото; если нет или ссылка/file_id битые — пошлём просто текст
-    photo = p["photo_url"]  # может быть HTTP(S) URL или telegram file_id
+    # подпись под фото: название, описание, цена и призыв выбрать кол-во
+    caption = (
+        f"*{p['title']}*\n"
+        f"{desc}\n\n"
+        f"Цена: *{p['price_cents']/100:.2f} {p['currency']}*\n"
+        f"_Выберите граммовку/количество:_"
+    )
+
     try:
-        if photo:
+        if p["photo_url"]:
             await cq.message.answer_photo(
-                photo=photo,
+                photo=p["photo_url"],              # URL или file_id
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=kb.as_markup()
@@ -422,6 +453,7 @@ async def choose_product_qty(cq: CallbackQuery):
         else:
             raise ValueError("no photo")
     except Exception:
+        # если фото битое — шлём просто текст
         await cq.message.answer(
             caption,
             parse_mode=ParseMode.MARKDOWN,
@@ -429,8 +461,6 @@ async def choose_product_qty(cq: CallbackQuery):
         )
 
     await cq.answer()
-
-
 
 # Выбрали количество → добавляем в корзину
 @dp.callback_query(F.data.startswith("addqty:"))
@@ -533,7 +563,13 @@ async def checkout(cq: CallbackQuery):
 # -------- Поддержка --------
 @dp.callback_query(F.data == "support")
 async def support_btn(cq: CallbackQuery):
-    await cq.message.answer("Напишите свой вопрос одной строкой: /support ваш_текст")
+    text = (
+        "Выберите способ обращения в поддержку:\n\n"
+        "📩 *Чат поддержки* — быстрый ответ прямо здесь.\n"
+        f"👤 *Менеджер (@{MANAGER_USERNAME})* — личные сообщения, "
+        "но ответ может занять до *5–6 часов*."
+    )
+    await cq.message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=support_kb())
     await cq.answer()
 
 @dp.message(Command("support"))
@@ -790,3 +826,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("🛑 Остановка бота.")
+
+import asyncio
+
+if __name__ == "__main__":
+    asyncio.run(dp.start_polling(bot))
